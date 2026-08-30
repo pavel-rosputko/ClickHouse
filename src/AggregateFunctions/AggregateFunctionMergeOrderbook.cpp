@@ -17,6 +17,8 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
 
+#include <Functions/FunctionHelpers.h>
+
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 
@@ -153,12 +155,15 @@ public:
         const auto & sizes_arr = assert_cast<const ColumnArray &>(*columns[1]);
         const auto & ops_arr = assert_cast<const ColumnArray &>(*columns[2]);
 
-        const size_t prices_offset = prices_arr.offsetAt(row_num);
-        const size_t prices_len = prices_arr.sizeAt(row_num);
-        const size_t sizes_offset = sizes_arr.offsetAt(row_num);
-        const size_t sizes_len = sizes_arr.sizeAt(row_num);
-        const size_t ops_offset = ops_arr.offsetAt(row_num);
-        const size_t ops_len = ops_arr.sizeAt(row_num);
+        const auto & prices_offsets = prices_arr.getOffsets();
+        const auto & sizes_offsets = sizes_arr.getOffsets();
+        const auto & ops_offsets = ops_arr.getOffsets();
+        const size_t prices_offset = prices_offsets[row_num - 1];
+        const size_t prices_len = prices_arr.getSize(row_num);
+        const size_t sizes_offset = sizes_offsets[row_num - 1];
+        const size_t sizes_len = sizes_arr.getSize(row_num);
+        const size_t ops_offset = ops_offsets[row_num - 1];
+        const size_t ops_len = ops_arr.getSize(row_num);
 
         if (prices_len != sizes_len || prices_len != ops_len)
             throw Exception(
@@ -210,10 +215,10 @@ public:
                 item.lvl.price = price_col.getData()[prices_offset + i];
             }
 
-            item.op = static_cast<DepthOp>(ops_col[ops_offset + i]);
-            if (item.op > DepthOp::Cancel)
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: invalid depth op {}", static_cast<UInt8>(item.op));
+            const Int8 op_raw = ops_col[ops_offset + i];
+            if (op_raw < 0 || op_raw > static_cast<Int8>(DepthOp::Cancel))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: invalid depth op {}", Int32(op_raw));
+            item.op = static_cast<DepthOp>(op_raw);
 
             if (item.op == DepthOp::Cancel && !item.lvl.isZero())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: cancel op requires zero size");
