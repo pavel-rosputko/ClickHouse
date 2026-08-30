@@ -3,11 +3,11 @@
 #include <AggregateFunctions/IAggregateFunction.h>
 
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnDecimal.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVector.h>
 #include <Columns/ColumnsDateTime.h>
 #include <Columns/ColumnsNumber.h>
-#include <Columns/ColumnDecimal.h>
 
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -39,6 +39,14 @@ namespace ErrorCodes
 namespace
 {
 
+/// Depth-row op (parallel to prices/sizes). Row-level kind remains delta|snapshot.
+enum class DepthOp : UInt8
+{
+    Insert = 0,
+    Change = 1,
+    Cancel = 2,
+};
+
 /// One orderbook level. Price stored as Decimal128(19) bits (same as Map(Int128, …) keys in MarketLens).
 struct OrderbookLevel
 {
@@ -47,13 +55,17 @@ struct OrderbookLevel
     UInt8 sign = 0;   // TripleSize.0
     Int128 base = 0;  // TripleSize.1 Decimal128(19) bits
     Int128 quote = 0; // TripleSize.2 Decimal128(19) bits
+    /// If true, a final zero is a tombstone (level may have lived before this state).
+    /// Set by: snapshot membership, change, or cancel-on-first-sighting.
+    /// Cleared by: insert (new life in this state).
+    bool existed_before = false;
 
     bool isZero() const { return base == 0 && quote == 0; }
 };
 
 struct AggregateFunctionMergeOrderbookData
 {
-    static constexpr UInt8 kSerializationVersion = 1;
+    static constexpr UInt8 kSerializationVersion = 2;
 
     DateTime64 snapshot_ts{0};
     /// Strictly sorted by price; at most one entry per price.
@@ -73,29 +85,28 @@ struct AggregateFunctionMergeOrderbookData
     }
 };
 
-/// mergeOrderbook(prices, sizes, ts, kind)
+/// mergeOrderbook(prices, sizes, ops, ts, kind)
 ///
-/// prices: Array(Decimal128(19))  — or Array(Int128) accepted as price bits
+/// prices: Array(Decimal128(19)) | Array(Int128) — strictly ascending, no duplicates
 /// sizes:  Array(Tuple(Bool, Decimal128(19), Decimal128(19)))
+/// ops:    Array(Enum8('insert'=0, 'change'=1, 'cancel'=2)) — per depth row
 /// ts:     DateTime64(6)
-/// kind:   Enum8('delta' = 0, 'snapshot' = 1)
+/// kind:   Enum8('delta'=0, 'snapshot'=1) — row-level
 ///
-/// Incoming prices must be strictly ascending with no duplicates (recorder contract).
-/// State: sorted levels + snapshot_ts. Merge is linear LWW-by-ts; snapshots prune
-/// older levels; zero sizes are dropped (no cemetery).
+/// Zero drop: remove final zeros only when !existed_before (ephemeral insert…cancel).
+/// change / leading cancel / snapshot levels set existed_before so tombstones are kept.
 class AggregateFunctionMergeOrderbook final
     : public IAggregateFunctionDataHelper<AggregateFunctionMergeOrderbookData, AggregateFunctionMergeOrderbook>
 {
 private:
     DataTypePtr price_type;
-    DataTypePtr size_triple_type;
     DataTypePtr datetime_type;
     bool prices_are_decimal = true;
 
     static DataTypePtr makeSizeTripleType()
     {
         return std::make_shared<DataTypeTuple>(DataTypes{
-            std::make_shared<DataTypeUInt8>(), // Bool stored as UInt8
+            std::make_shared<DataTypeUInt8>(),
             std::make_shared<DataTypeDecimal<Decimal128>>(38, 19),
             std::make_shared<DataTypeDecimal<Decimal128>>(38, 19),
         });
@@ -125,7 +136,6 @@ public:
                   std::make_shared<DataTypeArray>(makeLevelTupleType(price_type_, datetime_type_)),
               }))
         , price_type(std::move(price_type_))
-        , size_triple_type(makeSizeTripleType())
         , datetime_type(std::move(datetime_type_))
         , prices_are_decimal(prices_are_decimal_)
     {
@@ -141,23 +151,28 @@ public:
 
         const auto & prices_arr = assert_cast<const ColumnArray &>(*columns[0]);
         const auto & sizes_arr = assert_cast<const ColumnArray &>(*columns[1]);
+        const auto & ops_arr = assert_cast<const ColumnArray &>(*columns[2]);
 
         const size_t prices_offset = prices_arr.offsetAt(row_num);
         const size_t prices_len = prices_arr.sizeAt(row_num);
         const size_t sizes_offset = sizes_arr.offsetAt(row_num);
         const size_t sizes_len = sizes_arr.sizeAt(row_num);
+        const size_t ops_offset = ops_arr.offsetAt(row_num);
+        const size_t ops_len = ops_arr.sizeAt(row_num);
 
-        if (prices_len != sizes_len)
+        if (prices_len != sizes_len || prices_len != ops_len)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "mergeOrderbook: prices and sizes arrays must have equal length (got {} and {})",
+                "mergeOrderbook: prices, sizes, and ops arrays must have equal length (got {}, {}, {})",
                 prices_len,
-                sizes_len);
+                sizes_len,
+                ops_len);
 
-        const auto event_ts = assert_cast<const ColumnDateTime64 &>(*columns[2]).getData()[row_num];
-        const auto kind = assert_cast<const ColumnInt8 &>(*columns[3]).getData()[row_num]; // 0=delta, 1=snapshot
+        const auto event_ts = assert_cast<const ColumnDateTime64 &>(*columns[3]).getData()[row_num];
+        const auto row_kind = assert_cast<const ColumnInt8 &>(*columns[4]).getData()[row_num]; // 0=delta, 1=snapshot
+        const bool is_snapshot = row_kind == 1;
 
-        if (kind == 1 && data.snapshot_ts < event_ts)
+        if (is_snapshot && data.snapshot_ts < event_ts)
         {
             data.snapshot_ts = event_ts;
             data.pruneBefore(event_ts);
@@ -166,39 +181,50 @@ public:
         if (prices_len == 0)
             return;
 
-        std::vector<OrderbookLevel> batch;
+        std::vector<BatchLevel> batch;
         batch.reserve(prices_len);
 
         const auto & sizes_tuple = assert_cast<const ColumnTuple &>(sizes_arr.getData());
         const auto & sign_col = assert_cast<const ColumnUInt8 &>(sizes_tuple.getColumn(0)).getData();
         const auto & base_col = assert_cast<const ColumnDecimal<Decimal128> &>(sizes_tuple.getColumn(1)).getData();
         const auto & quote_col = assert_cast<const ColumnDecimal<Decimal128> &>(sizes_tuple.getColumn(2)).getData();
+        const auto & ops_col = assert_cast<const ColumnInt8 &>(ops_arr.getData()).getData();
 
-        // Caller guarantees prices are strictly ascending with no duplicates.
         for (size_t i = 0; i < prices_len; ++i)
         {
-            OrderbookLevel lvl;
-            lvl.ts = event_ts;
-            lvl.sign = sign_col[sizes_offset + i];
-            lvl.base = base_col[sizes_offset + i].value;
-            lvl.quote = quote_col[sizes_offset + i].value;
+            BatchLevel item;
+            item.lvl.ts = event_ts;
+            item.lvl.sign = sign_col[sizes_offset + i];
+            item.lvl.base = base_col[sizes_offset + i].value;
+            item.lvl.quote = quote_col[sizes_offset + i].value;
 
             if (prices_are_decimal)
             {
                 const auto & price_col
                     = assert_cast<const ColumnDecimal<Decimal128> &>(prices_arr.getData());
-                lvl.price = price_col.getData()[prices_offset + i].value;
+                item.lvl.price = price_col.getData()[prices_offset + i].value;
             }
             else
             {
                 const auto & price_col = assert_cast<const ColumnVector<Int128> &>(prices_arr.getData());
-                lvl.price = price_col.getData()[prices_offset + i];
+                item.lvl.price = price_col.getData()[prices_offset + i];
             }
 
-            batch.push_back(lvl);
+            item.op = static_cast<DepthOp>(ops_col[ops_offset + i]);
+            if (item.op > DepthOp::Cancel)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: invalid depth op {}", static_cast<UInt8>(item.op));
+
+            if (item.op == DepthOp::Cancel && !item.lvl.isZero())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: cancel op requires zero size");
+
+            if (is_snapshot && item.lvl.isZero())
+                continue; // absent from snap ⇒ gone after prune
+
+            batch.push_back(item);
         }
 
-        data.levels = mergeLevels(data.levels, batch, data.snapshot_ts);
+        data.levels = applyBatch(data.levels, batch, data.snapshot_ts, is_snapshot);
     }
 
     void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs_place, Arena *) const override
@@ -225,6 +251,7 @@ public:
             writeIntBinary(lvl.sign, buf);
             writeIntBinary(lvl.base, buf);
             writeIntBinary(lvl.quote, buf);
+            writeIntBinary(static_cast<UInt8>(lvl.existed_before), buf);
         }
     }
 
@@ -247,12 +274,15 @@ public:
         {
             auto & lvl = data.levels[i];
             Int64 ts = 0;
+            UInt8 existed = 0;
             readIntBinary(lvl.price, buf);
             readIntBinary(ts, buf);
             lvl.ts = DateTime64(ts);
             readIntBinary(lvl.sign, buf);
             readIntBinary(lvl.base, buf);
             readIntBinary(lvl.quote, buf);
+            readIntBinary(existed, buf);
+            lvl.existed_before = existed != 0;
         }
     }
 
@@ -292,7 +322,88 @@ public:
     }
 
 private:
-    /// Linear merge of two price-sorted level lists. LWW by ts; drop zeros; drop ts < snapshot_ts.
+    struct BatchLevel
+    {
+        OrderbookLevel lvl;
+        DepthOp op = DepthOp::Insert;
+    };
+
+    static bool shouldKeep(const OrderbookLevel & lvl, DateTime64 snapshot_ts)
+    {
+        if (snapshot_ts.value != 0 && lvl.ts < snapshot_ts)
+            return false;
+        if (lvl.isZero() && !lvl.existed_before)
+            return false;
+        return true;
+    }
+
+    /// Apply a sorted batch of depth ops onto sorted state.
+    static std::vector<OrderbookLevel> applyBatch(
+        const std::vector<OrderbookLevel> & state,
+        const std::vector<BatchLevel> & batch,
+        DateTime64 snapshot_ts,
+        bool is_snapshot)
+    {
+        std::vector<OrderbookLevel> out;
+        out.reserve(state.size() + batch.size());
+
+        size_t i = 0;
+        size_t j = 0;
+
+        const auto emit = [&](const OrderbookLevel & lvl) {
+            if (shouldKeep(lvl, snapshot_ts))
+                out.push_back(lvl);
+        };
+
+        const auto from_new = [&](const BatchLevel & item) -> OrderbookLevel {
+            OrderbookLevel lvl = item.lvl;
+            if (is_snapshot)
+                lvl.existed_before = true;
+            else if (item.op == DepthOp::Insert)
+                lvl.existed_before = false;
+            else // change or cancel on unseen price
+                lvl.existed_before = true;
+            return lvl;
+        };
+
+        const auto from_update = [&](const OrderbookLevel & prev, const BatchLevel & item) -> OrderbookLevel {
+            if (item.lvl.ts < prev.ts)
+                return prev;
+
+            OrderbookLevel lvl = item.lvl;
+            if (is_snapshot)
+                lvl.existed_before = true;
+            else if (item.op == DepthOp::Insert)
+                lvl.existed_before = false; // new life after prior tombstone/size
+            else if (item.op == DepthOp::Change)
+                lvl.existed_before = true;
+            else // cancel: preserve whether it lived before this state
+                lvl.existed_before = prev.existed_before;
+            return lvl;
+        };
+
+        while (i < state.size() && j < batch.size())
+        {
+            if (state[i].price < batch[j].lvl.price)
+                emit(state[i++]);
+            else if (state[i].price > batch[j].lvl.price)
+                emit(from_new(batch[j++]));
+            else
+            {
+                emit(from_update(state[i], batch[j]));
+                ++i;
+                ++j;
+            }
+        }
+        while (i < state.size())
+            emit(state[i++]);
+        while (j < batch.size())
+            emit(from_new(batch[j++]));
+
+        return out;
+    }
+
+    /// Merge two states (no ops). LWW by ts; existed_before OR'd (conservative across parts).
     static std::vector<OrderbookLevel> mergeLevels(
         const std::vector<OrderbookLevel> & a,
         const std::vector<OrderbookLevel> & b,
@@ -303,31 +414,23 @@ private:
 
         size_t i = 0;
         size_t j = 0;
-        const auto emit = [&](const OrderbookLevel & lvl) {
-            if (snapshot_ts.value != 0 && lvl.ts < snapshot_ts)
-                return;
-            if (lvl.isZero())
-                return;
-            out.push_back(lvl);
+
+        const auto emit = [&](OrderbookLevel lvl) {
+            if (shouldKeep(lvl, snapshot_ts))
+                out.push_back(lvl);
         };
 
         while (i < a.size() && j < b.size())
         {
             if (a[i].price < b[j].price)
-            {
                 emit(a[i++]);
-            }
             else if (a[i].price > b[j].price)
-            {
                 emit(b[j++]);
-            }
             else
             {
-                // Same price: higher ts wins; tie → prefer b (rhs).
-                if (a[i].ts > b[j].ts)
-                    emit(a[i]);
-                else
-                    emit(b[j]);
+                OrderbookLevel w = (a[i].ts > b[j].ts) ? a[i] : b[j];
+                w.existed_before = a[i].existed_before || b[j].existed_before;
+                emit(w);
                 ++i;
                 ++j;
             }
@@ -349,11 +452,12 @@ AggregateFunctionPtr createAggregateFunctionMergeOrderbook(
 {
     assertNoParameters(name, parameters);
 
-    if (argument_types.size() != 4)
+    if (argument_types.size() != 5)
         throw Exception(
             ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
-            "Aggregate function {} requires 4 arguments: "
-            "Array(price), Array(Tuple(Bool, Decimal128(19), Decimal128(19))), DateTime64(6), Enum8",
+            "Aggregate function {} requires 5 arguments: "
+            "Array(price), Array(Tuple(Bool, Decimal128(19), Decimal128(19))), "
+            "Array(Enum8), DateTime64(6), Enum8",
             name);
 
     const auto * prices_array = checkAndGetDataType<DataTypeArray>(argument_types[0].get());
@@ -401,7 +505,6 @@ AggregateFunctionPtr createAggregateFunctionMergeOrderbook(
             name,
             sizes_array->getNestedType()->getName());
 
-    // sign: Bool or UInt8
     const auto & sign_ty = size_tuple->getElements()[0];
     if (!(isUInt8(sign_ty) || isBool(sign_ty)))
         throw Exception(
@@ -422,24 +525,40 @@ AggregateFunctionPtr createAggregateFunctionMergeOrderbook(
                 size_tuple->getElements()[k]->getName());
     }
 
-    const auto * dt = checkAndGetDataType<DataTypeDateTime64>(argument_types[2].get());
-    if (!dt || dt->getScale() != 6)
+    const auto * ops_array = checkAndGetDataType<DataTypeArray>(argument_types[2].get());
+    if (!ops_array)
         throw Exception(
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-            "Argument 3 for function {} must be DateTime64(6), got {}",
+            "Argument 3 for function {} must be Array, got {}",
             name,
             argument_types[2]->getName());
 
-    const auto * kind = checkAndGetDataType<DataTypeEnum8>(argument_types[3].get());
-    if (!kind)
+    const auto * ops_enum = checkAndGetDataType<DataTypeEnum8>(ops_array->getNestedType().get());
+    if (!ops_enum)
         throw Exception(
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-            "Argument 4 for function {} must be Enum8, got {}",
+            "Argument 3 nested type for function {} must be Enum8('insert','change','cancel'), got {}",
+            name,
+            ops_array->getNestedType()->getName());
+
+    const auto * dt = checkAndGetDataType<DataTypeDateTime64>(argument_types[3].get());
+    if (!dt || dt->getScale() != 6)
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "Argument 4 for function {} must be DateTime64(6), got {}",
             name,
             argument_types[3]->getName());
 
+    const auto * kind = checkAndGetDataType<DataTypeEnum8>(argument_types[4].get());
+    if (!kind)
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "Argument 5 for function {} must be Enum8, got {}",
+            name,
+            argument_types[4]->getName());
+
     return std::make_shared<AggregateFunctionMergeOrderbook>(
-        argument_types, parameters, price_type, argument_types[2], prices_are_decimal);
+        argument_types, parameters, price_type, argument_types[3], prices_are_decimal);
 }
 
 }
@@ -447,17 +566,20 @@ AggregateFunctionPtr createAggregateFunctionMergeOrderbook(
 void registerAggregateFunctionMergeOrderbook(AggregateFunctionFactory & factory)
 {
     FunctionDocumentation::Description description = R"(
-Merges orderbook level updates into a sorted book.
-Last-write-wins by timestamp per price; snapshot kind advances a watermark
-that prunes older levels; zero sizes are dropped.
-Incoming price arrays must be strictly ascending with no duplicates.
+Merges orderbook depth updates into a sorted book.
+Per-level ops: insert / change / cancel. Row-level kind: delta / snapshot.
+Last-write-wins by timestamp; snapshots prune older levels.
+Final zeros are dropped only when the level did not exist before this state
+(insert…cancel); change, leading cancel, and snapshot levels keep tombstones.
+Incoming prices must be strictly ascending with no duplicates.
     )";
-    FunctionDocumentation::Syntax syntax = "mergeOrderbook(prices, sizes, ts, kind)";
+    FunctionDocumentation::Syntax syntax = "mergeOrderbook(prices, sizes, ops, ts, kind)";
     FunctionDocumentation::Arguments arguments = {
         {"prices", "Sorted unique price levels.", {"Array(Decimal128(19))", "Array(Int128)"}},
         {"sizes", "Parallel TripleSize values.", {"Array(Tuple(Bool, Decimal128(19), Decimal128(19)))"}},
+        {"ops", "Per-level insert/change/cancel.", {"Array(Enum8)"}},
         {"ts", "Event timestamp.", {"DateTime64(6)"}},
-        {"kind", "delta or snapshot.", {"Enum8"}},
+        {"kind", "Row-level delta or snapshot.", {"Enum8"}},
     };
     FunctionDocumentation::ReturnedValue returned_value = {
         "Tuple(snapshot_ts, Array(Tuple(price, level_ts, size_triple))).",
