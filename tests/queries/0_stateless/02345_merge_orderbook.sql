@@ -31,7 +31,8 @@ SELECT
     arraySort(arrayMap(x -> (tupleElement(x, 1), tupleElement(tupleElement(x, 3), 2)), tupleElement(r, 2))) AS price_base
 FROM (SELECT mergeOrderbook(prices, sizes, ops, ts, kind) AS r FROM mob_src);
 
--- Snapshot establishes book; later change→cancel keeps tombstone; insert→cancel after snap drops
+-- Snapshot = clean slate: cancel of snap level drops (no tombstone); insert→cancel drops;
+-- only remaining live snap levels stay.
 DROP TABLE IF EXISTS mob_snap;
 CREATE TABLE mob_snap
 (
@@ -45,6 +46,8 @@ CREATE TABLE mob_snap
 INSERT INTO mob_snap VALUES
     ([10, 20], [(true, 1, 1), (false, 2, 2)], ['insert', 'insert'], toDateTime64(500, 6, 'UTC'), 'snapshot'),
     ([10], [(true, 0, 0)], ['cancel'], toDateTime64(600, 6, 'UTC'), 'delta'),
+    ([20], [(false, 5, 5)], ['change'], toDateTime64(605, 6, 'UTC'), 'delta'),
+    ([20], [(true, 0, 0)], ['cancel'], toDateTime64(608, 6, 'UTC'), 'delta'),
     ([30], [(true, 3, 3)], ['insert'], toDateTime64(610, 6, 'UTC'), 'delta'),
     ([30], [(true, 0, 0)], ['cancel'], toDateTime64(620, 6, 'UTC'), 'delta');
 

@@ -95,8 +95,11 @@ struct AggregateFunctionMergeOrderbookData
 /// ts:     DateTime64(6)
 /// kind:   Enum8('delta'=0, 'snapshot'=1) — row-level
 ///
-/// Zero drop: remove final zeros only when !existed_before (ephemeral insert…cancel).
-/// change / leading cancel / snapshot levels set existed_before so tombstones are kept.
+/// Zero drop:
+/// - If state has snapshot_ts: drop all zeros (bucket applies as a snapshot; absence = gone).
+/// - Else: drop zeros only when !existed_before (ephemeral insert…cancel).
+/// change / leading cancel set existed_before (delta-only tombstones).
+/// Snapshot levels start with existed_before=false (clean slate after prune).
 class AggregateFunctionMergeOrderbook final
     : public IAggregateFunctionDataHelper<AggregateFunctionMergeOrderbookData, AggregateFunctionMergeOrderbook>
 {
@@ -337,6 +340,9 @@ private:
     {
         if (snapshot_ts.value != 0 && lvl.ts < snapshot_ts)
             return false;
+        // State with a snapshot is applied as a full book replace: no zero tombstones.
+        if (lvl.isZero() && snapshot_ts.value != 0)
+            return false;
         if (lvl.isZero() && !lvl.existed_before)
             return false;
         return true;
@@ -362,11 +368,10 @@ private:
 
         const auto from_new = [&](const BatchLevel & item) -> OrderbookLevel {
             OrderbookLevel lvl = item.lvl;
-            if (is_snapshot)
-                lvl.existed_before = true;
-            else if (item.op == DepthOp::Insert)
+            if (is_snapshot || item.op == DepthOp::Insert)
+                // Snapshot = replace after prune; insert = born in this state.
                 lvl.existed_before = false;
-            else // change or cancel on unseen price
+            else // change or cancel on unseen price (delta-only prior life)
                 lvl.existed_before = true;
             return lvl;
         };
@@ -376,10 +381,8 @@ private:
                 return prev;
 
             OrderbookLevel lvl = item.lvl;
-            if (is_snapshot)
-                lvl.existed_before = true;
-            else if (item.op == DepthOp::Insert)
-                lvl.existed_before = false; // new life after prior tombstone/size
+            if (is_snapshot || item.op == DepthOp::Insert)
+                lvl.existed_before = false;
             else if (item.op == DepthOp::Change)
                 lvl.existed_before = true;
             else // cancel: preserve whether it lived before this state
@@ -574,8 +577,9 @@ void registerAggregateFunctionMergeOrderbook(AggregateFunctionFactory & factory)
 Merges orderbook depth updates into a sorted book.
 Per-level ops: insert / change / cancel. Row-level kind: delta / snapshot.
 Last-write-wins by timestamp; snapshots prune older levels.
-Final zeros are dropped only when the level did not exist before this state
-(insert…cancel); change, leading cancel, and snapshot levels keep tombstones.
+If the state has a snapshot_ts, final zeros are dropped (applied as a snapshot).
+Otherwise zeros are kept only as tombstones when existed_before
+(change or leading cancel); insert…cancel is ephemeral and dropped.
 Incoming prices must be strictly ascending with no duplicates.
     )";
     FunctionDocumentation::Syntax syntax = "mergeOrderbook(prices, sizes, ops, ts, kind)";
