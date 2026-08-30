@@ -266,7 +266,7 @@ public:
         UInt8 version = 0;
         readIntBinary(version, buf);
         if (version != AggregateFunctionMergeOrderbookData::kSerializationVersion)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: unsupported state version {}", version);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: unsupported state version {}", UInt32(version));
 
         Int64 snap = 0;
         readIntBinary(snap, buf);
