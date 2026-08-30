@@ -598,9 +598,9 @@ Incoming prices must be strictly ascending with no duplicates.
     FunctionDocumentation::Arguments arguments = {
         {"prices", "Sorted unique price levels.", {"Array(Decimal128(19))", "Array(Int128)"}},
         {"sizes", "Parallel TripleSize values.", {"Array(Tuple(Bool, Decimal128(19), Decimal128(19)))"}},
-        {"ops", "Per-level insert/change/cancel.", {"Array(Enum8)"}},
+        {"ops", "Per-level insert/change/cancel (Enum8).", {"Array(Enum)"}},
         {"ts", "Event timestamp.", {"DateTime64(6)"}},
-        {"kind", "Row-level delta or snapshot.", {"Enum8"}},
+        {"kind", "Row-level delta or snapshot (Enum8).", {"Enum"}},
     };
     FunctionDocumentation::ReturnedValue returned_value = {
         "Tuple(snapshot_ts, Array(Tuple(price, level_ts, size_triple))).",
