@@ -98,8 +98,10 @@ struct AggregateFunctionMergeOrderbookData
 /// Zero drop:
 /// - If state has snapshot_ts: drop all zeros (bucket applies as a snapshot; absence = gone).
 /// - Else: drop zeros only when !existed_before (ephemeral insert…cancel).
-/// change / leading cancel set existed_before (delta-only tombstones).
-/// Snapshot levels start with existed_before=false (clean slate after prune).
+/// First sighting change/cancel sets existed_before; later change/cancel preserve it;
+/// insert clears it (new life). Snapshot levels start false.
+/// State merge: size from later ts; eb from earlier, except rebirth (earlier 0, later +)
+/// takes later.eb.
 class AggregateFunctionMergeOrderbook final
     : public IAggregateFunctionDataHelper<AggregateFunctionMergeOrderbookData, AggregateFunctionMergeOrderbook>
 {
@@ -382,10 +384,9 @@ private:
 
             OrderbookLevel lvl = item.lvl;
             if (is_snapshot || item.op == DepthOp::Insert)
-                lvl.existed_before = false;
-            else if (item.op == DepthOp::Change)
-                lvl.existed_before = true;
-            else // cancel: preserve whether it lived before this state
+                lvl.existed_before = false; // clean slate / new life in this state
+            else
+                // change or cancel: existed_before is about life before this state, not before this op
                 lvl.existed_before = prev.existed_before;
             return lvl;
         };
@@ -411,7 +412,9 @@ private:
         return out;
     }
 
-    /// Merge two states (no ops). LWW by ts; existed_before OR'd (conservative across parts).
+    /// Merge two states (no ops). Size/ts LWW (later wins); existed_before hybrid:
+    /// - later live after earlier zero (rebirth) → take later.eb (insert clears prior)
+    /// - otherwise → take earlier.eb (earlier witness of "lived before this state")
     static std::vector<OrderbookLevel> mergeLevels(
         const std::vector<OrderbookLevel> & a,
         const std::vector<OrderbookLevel> & b,
@@ -428,6 +431,17 @@ private:
                 out.push_back(lvl);
         };
 
+        const auto combine = [](const OrderbookLevel & x, const OrderbookLevel & y) {
+            const OrderbookLevel & earlier = (x.ts <= y.ts) ? x : y;
+            const OrderbookLevel & later = (x.ts <= y.ts) ? y : x;
+            OrderbookLevel w = later; // size/ts from later (tie → y when x.ts == y.ts via <=)
+            if (!later.isZero() && earlier.isZero())
+                w.existed_before = later.existed_before; // rebirth
+            else
+                w.existed_before = earlier.existed_before;
+            return w;
+        };
+
         while (i < a.size() && j < b.size())
         {
             if (a[i].price < b[j].price)
@@ -436,9 +450,7 @@ private:
                 emit(b[j++]);
             else
             {
-                OrderbookLevel w = (a[i].ts > b[j].ts) ? a[i] : b[j];
-                w.existed_before = a[i].existed_before || b[j].existed_before;
-                emit(w);
+                emit(combine(a[i], b[j]));
                 ++i;
                 ++j;
             }
