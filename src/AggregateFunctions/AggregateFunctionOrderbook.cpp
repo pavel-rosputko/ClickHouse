@@ -65,7 +65,7 @@ struct OrderbookLevel
     bool isZero() const { return base == 0 && quote == 0; }
 };
 
-struct AggregateFunctionMergeOrderbookData
+struct AggregateFunctionOrderbookData
 {
     static constexpr UInt8 kSerializationVersion = 2;
 
@@ -87,7 +87,7 @@ struct AggregateFunctionMergeOrderbookData
     }
 };
 
-/// mergeOrderbook(prices, sizes, ops, ts, kind)
+/// orderbook(prices, sizes, ops, ts, kind)
 ///
 /// prices: Array(Decimal128(19)) | Array(Int128) — strictly ascending, no duplicates
 /// sizes:  Array(Tuple(Bool, Decimal128(19), Decimal128(19)))
@@ -102,8 +102,8 @@ struct AggregateFunctionMergeOrderbookData
 /// insert clears it (new life). Snapshot levels start false.
 /// State merge: size from later ts; eb from earlier, except rebirth (earlier 0, later +)
 /// takes later.eb.
-class AggregateFunctionMergeOrderbook final
-    : public IAggregateFunctionDataHelper<AggregateFunctionMergeOrderbookData, AggregateFunctionMergeOrderbook>
+class AggregateFunctionOrderbook final
+    : public IAggregateFunctionDataHelper<AggregateFunctionOrderbookData, AggregateFunctionOrderbook>
 {
 private:
     DataTypePtr price_type;
@@ -129,7 +129,7 @@ private:
     }
 
 public:
-    AggregateFunctionMergeOrderbook(
+    AggregateFunctionOrderbook(
         const DataTypes & argument_types_,
         const Array & parameters_,
         DataTypePtr price_type_,
@@ -148,7 +148,7 @@ public:
     {
     }
 
-    String getName() const override { return "mergeOrderbook"; }
+    String getName() const override { return "orderbook"; }
 
     bool allocatesMemoryInArena() const override { return false; }
 
@@ -173,7 +173,7 @@ public:
         if (prices_len != sizes_len || prices_len != ops_len)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "mergeOrderbook: prices, sizes, and ops arrays must have equal length (got {}, {}, {})",
+                "orderbook: prices, sizes, and ops arrays must have equal length (got {}, {}, {})",
                 prices_len,
                 sizes_len,
                 ops_len);
@@ -222,11 +222,11 @@ public:
 
             const Int8 op_raw = ops_col[ops_offset + i];
             if (op_raw < 0 || op_raw > static_cast<Int8>(DepthOp::Cancel))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: invalid depth op {}", Int32(op_raw));
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "orderbook: invalid depth op {}", Int32(op_raw));
             item.op = static_cast<DepthOp>(op_raw);
 
             if (item.op == DepthOp::Cancel && !item.lvl.isZero())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: cancel op requires zero size");
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "orderbook: cancel op requires zero size");
 
             if (is_snapshot && item.lvl.isZero())
                 continue; // absent from snap ⇒ gone after prune
@@ -251,7 +251,7 @@ public:
     void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /* version */) const override
     {
         const auto & data = this->data(place);
-        writeIntBinary(AggregateFunctionMergeOrderbookData::kSerializationVersion, buf);
+        writeIntBinary(AggregateFunctionOrderbookData::kSerializationVersion, buf);
         writeIntBinary(data.snapshot_ts.value, buf);
         writeVarUInt(data.levels.size(), buf);
         for (const auto & lvl : data.levels)
@@ -270,8 +270,8 @@ public:
         auto & data = this->data(place);
         UInt8 version = 0;
         readIntBinary(version, buf);
-        if (version != AggregateFunctionMergeOrderbookData::kSerializationVersion)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "mergeOrderbook: unsupported state version {}", UInt32(version));
+        if (version != AggregateFunctionOrderbookData::kSerializationVersion)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "orderbook: unsupported state version {}", UInt32(version));
 
         Int64 snap = 0;
         readIntBinary(snap, buf);
@@ -464,7 +464,7 @@ private:
     }
 };
 
-AggregateFunctionPtr createAggregateFunctionMergeOrderbook(
+AggregateFunctionPtr createAggregateFunctionOrderbook(
     const std::string & name,
     const DataTypes & argument_types,
     const Array & parameters,
@@ -577,13 +577,13 @@ AggregateFunctionPtr createAggregateFunctionMergeOrderbook(
             name,
             argument_types[4]->getName());
 
-    return std::make_shared<AggregateFunctionMergeOrderbook>(
+    return std::make_shared<AggregateFunctionOrderbook>(
         argument_types, parameters, price_type, argument_types[3], prices_are_decimal);
 }
 
 }
 
-void registerAggregateFunctionMergeOrderbook(AggregateFunctionFactory & factory)
+void registerAggregateFunctionOrderbook(AggregateFunctionFactory & factory)
 {
     FunctionDocumentation::Description description = R"(
 Merges orderbook depth updates into a sorted book.
@@ -594,7 +594,7 @@ Otherwise zeros are kept only as tombstones when existed_before
 (change or leading cancel); insert…cancel is ephemeral and dropped.
 Incoming prices must be strictly ascending with no duplicates.
     )";
-    FunctionDocumentation::Syntax syntax = "mergeOrderbook(prices, sizes, ops, ts, kind)";
+    FunctionDocumentation::Syntax syntax = "orderbook(prices, sizes, ops, ts, kind)";
     FunctionDocumentation::Arguments arguments = {
         {"prices", "Sorted unique price levels.", {"Array(Decimal128(19))", "Array(Int128)"}},
         {"sizes", "Parallel TripleSize values.", {"Array(Tuple(Bool, Decimal128(19), Decimal128(19)))"}},
@@ -614,7 +614,7 @@ Incoming prices must be strictly ascending with no duplicates.
 
     AggregateFunctionProperties properties
         = {.returns_default_when_only_null = true, .is_order_dependent = true};
-    factory.registerFunction("mergeOrderbook", {createAggregateFunctionMergeOrderbook, documentation, properties});
+    factory.registerFunction("orderbook", {createAggregateFunctionOrderbook, documentation, properties});
 }
 
 }

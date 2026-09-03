@@ -1,5 +1,5 @@
 -- Tags: no-fasttest
--- mergeOrderbook: insert/change/cancel depth ops + row-level snapshot; ephemeral zero drop.
+-- orderbook: insert/change/cancel depth ops + row-level snapshot; ephemeral zero drop.
 
 DROP TABLE IF EXISTS mob_src;
 CREATE TABLE mob_src
@@ -34,7 +34,7 @@ INSERT INTO mob_src VALUES
 SELECT
     arraySort(arrayMap(x -> tupleElement(x, 1), tupleElement(r, 2))) AS prices,
     arraySort(arrayMap(x -> (tupleElement(x, 1), tupleElement(tupleElement(x, 3), 2)), tupleElement(r, 2))) AS price_base
-FROM (SELECT mergeOrderbook(prices, sizes, ops, ts, kind) AS r FROM mob_src);
+FROM (SELECT orderbook(prices, sizes, ops, ts, kind) AS r FROM mob_src);
 
 -- Snapshot = clean slate: cancel of snap level drops (no tombstone); insert→cancel drops;
 -- only remaining live snap levels stay.
@@ -59,7 +59,7 @@ INSERT INTO mob_snap VALUES
 SELECT
     tupleElement(r, 1) AS snapshot_ts,
     arraySort(arrayMap(x -> (tupleElement(x, 1), tupleElement(tupleElement(x, 3), 2)), tupleElement(r, 2))) AS price_base
-FROM (SELECT mergeOrderbook(prices, sizes, ops, ts, kind) AS r FROM mob_snap);
+FROM (SELECT orderbook(prices, sizes, ops, ts, kind) AS r FROM mob_snap);
 
 DROP TABLE mob_src;
 DROP TABLE mob_snap;
