@@ -41,12 +41,13 @@ namespace ErrorCodes
 namespace
 {
 
-/// Depth-row op (parallel to prices/sizes). Row-level kind remains delta|snapshot.
+/// Depth-row op (parallel to prices/sizes). Matches Enum('insert','change','cancel')
+/// (CH Enum defaults start at 1 — same style as kind Enum('snapshot','delta')).
 enum class DepthOp : UInt8
 {
-    Insert = 0,
-    Change = 1,
-    Cancel = 2,
+    Insert = 1,
+    Change = 2,
+    Cancel = 3,
 };
 
 /// One orderbook level. Price stored as Decimal128(19) bits (same as Map(Int128, …) keys in MarketLens).
@@ -93,9 +94,9 @@ struct AggregateFunctionOrderbookData
 ///
 /// prices: Array(Decimal128(19)) | Array(Int128) — strictly ascending, no duplicates
 /// sizes:  Array(Tuple(Bool, Decimal128(19), Decimal128(19)))
-/// ops:    Array(Enum8('insert'=0, 'change'=1, 'cancel'=2)) — per depth row
+/// ops:    Array(Enum('insert', 'change', 'cancel')) — values 1, 2, 3
 /// ts:     DateTime64(6)
-/// kind:   Enum8('delta'=0, 'snapshot'=1) — row-level
+/// kind:   Enum('snapshot', 'delta') — values 1, 2 (same as raw orderbooks / Rust OrderbookKind)
 ///
 /// Zero drop:
 /// - If state has snapshot_ts: drop all zeros (bucket applies as a snapshot; absence = gone).
@@ -182,7 +183,8 @@ public:
                 ops_len);
 
         const auto event_ts = assert_cast<const ColumnDateTime64 &>(*columns[3]).getData()[row_num];
-        const auto row_kind = assert_cast<const ColumnInt8 &>(*columns[4]).getData()[row_num]; // 0=delta, 1=snapshot
+        // Enum('snapshot','delta') → snapshot=1, delta=2 (CH Enum defaults start at 1).
+        const auto row_kind = assert_cast<const ColumnInt8 &>(*columns[4]).getData()[row_num];
         const bool is_snapshot = row_kind == 1;
 
         if (is_snapshot && data.snapshot_ts < event_ts)
@@ -224,7 +226,8 @@ public:
             }
 
             const Int8 op_raw = ops_col[ops_offset + i];
-            if (op_raw < 0 || op_raw > static_cast<Int8>(DepthOp::Cancel))
+            if (op_raw < static_cast<Int8>(DepthOp::Insert)
+                || op_raw > static_cast<Int8>(DepthOp::Cancel))
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "orderbook: invalid depth op {}", Int32(op_raw));
             item.op = static_cast<DepthOp>(op_raw);
 
@@ -558,7 +561,7 @@ AggregateFunctionPtr createAggregateFunctionOrderbook(
     if (!ops_enum)
         throw Exception(
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-            "Argument 3 nested type for function {} must be Enum8('insert','change','cancel'), got {}",
+            "Argument 3 nested type for function {} must be Enum('insert','change','cancel'), got {}",
             name,
             ops_array->getNestedType()->getName());
 
@@ -588,7 +591,7 @@ void registerAggregateFunctionOrderbook(AggregateFunctionFactory & factory)
 {
     FunctionDocumentation::Description description = R"(
 Merges orderbook depth updates into a sorted book.
-Per-level ops: insert / change / cancel. Row-level kind: delta / snapshot.
+Per-level ops: insert / change / cancel. Row-level kind: Enum('snapshot', 'delta').
 Last-write-wins by timestamp; snapshots prune older levels.
 If the state has a snapshot_ts, final zeros are dropped (applied as a snapshot).
 Otherwise zeros are kept only as tombstones when existed_before
