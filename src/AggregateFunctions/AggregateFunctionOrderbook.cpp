@@ -50,14 +50,14 @@ enum class DepthOp : UInt8
     Cancel = 3,
 };
 
-/// One orderbook level. Price stored as Decimal128(19) bits (same as Map(Int128, …) keys in MarketLens).
+/// One orderbook level. Price / sizes as Decimal128(19) bits (same as MarketLens).
+/// Sizes are signed: bid > 0, ask < 0 (no separate Bool sign).
 struct OrderbookLevel
 {
     Int128 price = 0;
     DateTime64 ts{0}; // scale 6
-    UInt8 sign = 0;   // TripleSize.0
-    Int128 base = 0;  // TripleSize.1 Decimal128(19) bits
-    Int128 quote = 0; // TripleSize.2 Decimal128(19) bits
+    Int128 base = 0;  // signed Decimal128(19) bits
+    Int128 quote = 0; // signed Decimal128(19) bits
     /// If true, a final zero is a tombstone (level may have lived before this state).
     /// Set by: first-sighting change/cancel (`from_new`).
     /// Cleared by: first-sighting insert or snapshot membership (`from_new` / snapshot).
@@ -70,7 +70,8 @@ struct OrderbookLevel
 
 struct AggregateFunctionOrderbookData
 {
-    static constexpr UInt8 kSerializationVersion = 2;
+    /// v3: sizes are signed Tuple(base, quote); dropped Bool sign.
+    static constexpr UInt8 kSerializationVersion = 3;
 
     DateTime64 snapshot_ts{0};
     /// Strictly sorted by price; at most one entry per price.
@@ -93,7 +94,7 @@ struct AggregateFunctionOrderbookData
 /// orderbook(prices, sizes, ops, ts, kind)
 ///
 /// prices: Array(Decimal128(19)) | Array(Int128) — strictly ascending, no duplicates
-/// sizes:  Array(Tuple(Bool, Decimal128(19), Decimal128(19)))
+/// sizes:  Array(Tuple(Decimal128(19), Decimal128(19))) — signed (base, quote); bid>0 ask<0
 /// ops:    Array(Enum('insert', 'change', 'cancel')) — values 1, 2, 3
 /// ts:     DateTime64(6)
 /// kind:   Enum('snapshot', 'delta') — values 1, 2 (same as raw orderbooks / Rust OrderbookKind)
@@ -114,10 +115,9 @@ private:
     DataTypePtr datetime_type;
     bool prices_are_decimal = true;
 
-    static DataTypePtr makeSizeTripleType()
+    static DataTypePtr makeSizeTupleType()
     {
         return std::make_shared<DataTypeTuple>(DataTypes{
-            std::make_shared<DataTypeUInt8>(),
             std::make_shared<DataTypeDecimal<Decimal128>>(38, 19),
             std::make_shared<DataTypeDecimal<Decimal128>>(38, 19),
         });
@@ -128,7 +128,7 @@ private:
         return std::make_shared<DataTypeTuple>(DataTypes{
             price_ty,
             dt_ty,
-            makeSizeTripleType(),
+            makeSizeTupleType(),
         });
     }
 
@@ -200,16 +200,14 @@ public:
         batch.reserve(prices_len);
 
         const auto & sizes_tuple = assert_cast<const ColumnTuple &>(sizes_arr.getData());
-        const auto & sign_col = assert_cast<const ColumnUInt8 &>(sizes_tuple.getColumn(0)).getData();
-        const auto & base_col = assert_cast<const ColumnDecimal<Decimal128> &>(sizes_tuple.getColumn(1)).getData();
-        const auto & quote_col = assert_cast<const ColumnDecimal<Decimal128> &>(sizes_tuple.getColumn(2)).getData();
+        const auto & base_col = assert_cast<const ColumnDecimal<Decimal128> &>(sizes_tuple.getColumn(0)).getData();
+        const auto & quote_col = assert_cast<const ColumnDecimal<Decimal128> &>(sizes_tuple.getColumn(1)).getData();
         const auto & ops_col = assert_cast<const ColumnInt8 &>(ops_arr.getData()).getData();
 
         for (size_t i = 0; i < prices_len; ++i)
         {
             BatchLevel item;
             item.lvl.ts = event_ts;
-            item.lvl.sign = sign_col[sizes_offset + i];
             item.lvl.base = base_col[sizes_offset + i].value;
             item.lvl.quote = quote_col[sizes_offset + i].value;
 
@@ -264,7 +262,6 @@ public:
         {
             writeIntBinary(lvl.price, buf);
             writeIntBinary(lvl.ts.value, buf);
-            writeIntBinary(lvl.sign, buf);
             writeIntBinary(lvl.base, buf);
             writeIntBinary(lvl.quote, buf);
             writeIntBinary(static_cast<UInt8>(lvl.existed_before), buf);
@@ -294,7 +291,6 @@ public:
             readIntBinary(lvl.price, buf);
             readIntBinary(ts, buf);
             lvl.ts = DateTime64(ts);
-            readIntBinary(lvl.sign, buf);
             readIntBinary(lvl.base, buf);
             readIntBinary(lvl.quote, buf);
             readIntBinary(existed, buf);
@@ -316,9 +312,8 @@ public:
         auto & out_prices = levels_tuple.getColumn(0);
         auto & out_tss = assert_cast<ColumnDateTime64 &>(levels_tuple.getColumn(1));
         auto & out_sizes = assert_cast<ColumnTuple &>(levels_tuple.getColumn(2));
-        auto & out_sign = assert_cast<ColumnUInt8 &>(out_sizes.getColumn(0));
-        auto & out_base = assert_cast<ColumnDecimal<Decimal128> &>(out_sizes.getColumn(1));
-        auto & out_quote = assert_cast<ColumnDecimal<Decimal128> &>(out_sizes.getColumn(2));
+        auto & out_base = assert_cast<ColumnDecimal<Decimal128> &>(out_sizes.getColumn(0));
+        auto & out_quote = assert_cast<ColumnDecimal<Decimal128> &>(out_sizes.getColumn(1));
 
         const size_t n = data.levels.size();
         levels_arr.getOffsets().push_back(levels_arr.getOffsets().back() + n);
@@ -331,7 +326,6 @@ public:
                 assert_cast<ColumnVector<Int128> &>(out_prices).insertValue(lvl.price);
 
             out_tss.insertValue(lvl.ts);
-            out_sign.insertValue(lvl.sign);
             out_base.insertValue(Decimal128(lvl.base));
             out_quote.insertValue(Decimal128(lvl.quote));
         }
@@ -480,8 +474,8 @@ AggregateFunctionPtr createAggregateFunctionOrderbook(
         throw Exception(
             ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
             "Aggregate function {} requires 5 arguments: "
-            "Array(price), Array(Tuple(Bool, Decimal128(19), Decimal128(19))), "
-            "Array(Enum8), DateTime64(6), Enum8",
+            "Array(price), Array(Tuple(Decimal128(19), Decimal128(19))), "
+            "Array(Enum), DateTime64(6), Enum",
             name);
 
     const auto * prices_array = checkAndGetDataType<DataTypeArray>(argument_types[0].get());
@@ -522,22 +516,14 @@ AggregateFunctionPtr createAggregateFunctionOrderbook(
             argument_types[1]->getName());
 
     const auto * size_tuple = checkAndGetDataType<DataTypeTuple>(sizes_array->getNestedType().get());
-    if (!size_tuple || size_tuple->getElements().size() != 3)
+    if (!size_tuple || size_tuple->getElements().size() != 2)
         throw Exception(
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-            "Argument 2 nested type for function {} must be Tuple(Bool/UInt8, Decimal128(19), Decimal128(19)), got {}",
+            "Argument 2 nested type for function {} must be Tuple(Decimal128(19), Decimal128(19)), got {}",
             name,
             sizes_array->getNestedType()->getName());
 
-    const auto & sign_ty = size_tuple->getElements()[0];
-    if (!(isUInt8(sign_ty) || isBool(sign_ty)))
-        throw Exception(
-            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-            "sizes.1 for function {} must be Bool or UInt8, got {}",
-            name,
-            sign_ty->getName());
-
-    for (size_t k : {size_t(1), size_t(2)})
+    for (size_t k : {size_t(0), size_t(1)})
     {
         const auto * dec = checkDecimal<Decimal128>(*size_tuple->getElements()[k]);
         if (!dec || dec->getScale() != 19)
@@ -602,13 +588,13 @@ Incoming prices must be strictly ascending with no duplicates.
     FunctionDocumentation::Syntax syntax = "orderbook(prices, sizes, ops, ts, kind)";
     FunctionDocumentation::Arguments arguments = {
         {"prices", "Sorted unique price levels.", {"Array(Decimal128(19))", "Array(Int128)"}},
-        {"sizes", "Parallel TripleSize values.", {"Array(Tuple(Bool, Decimal128(19), Decimal128(19)))"}},
-        {"ops", "Per-level insert/change/cancel (Enum8).", {"Array(Enum)"}},
+        {"sizes", "Parallel signed (base, quote) sizes; bid>0 ask<0.", {"Array(Tuple(Decimal128(19), Decimal128(19)))"}},
+        {"ops", "Per-level insert/change/cancel.", {"Array(Enum)"}},
         {"ts", "Event timestamp.", {"DateTime64(6)"}},
-        {"kind", "Row-level delta or snapshot (Enum8).", {"Enum"}},
+        {"kind", "Row-level snapshot or delta.", {"Enum"}},
     };
     FunctionDocumentation::ReturnedValue returned_value = {
-        "Tuple(snapshot_ts, Array(Tuple(price, level_ts, size_triple))).",
+        "Tuple(snapshot_ts, Array(Tuple(price, level_ts, Tuple(base, quote)))).",
         {"Tuple"},
     };
     FunctionDocumentation::Examples examples;
