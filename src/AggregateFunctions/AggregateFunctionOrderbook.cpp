@@ -58,8 +58,10 @@ struct OrderbookLevel
     Int128 base = 0;  // TripleSize.1 Decimal128(19) bits
     Int128 quote = 0; // TripleSize.2 Decimal128(19) bits
     /// If true, a final zero is a tombstone (level may have lived before this state).
-    /// Set by: snapshot membership, change, or cancel-on-first-sighting.
-    /// Cleared by: insert (new life in this state).
+    /// Set by: first-sighting change/cancel (`from_new`).
+    /// Cleared by: first-sighting insert or snapshot membership (`from_new` / snapshot).
+    /// Not cleared by insert when updating an existing state level (cancel→insert must
+    /// keep the prior witness so a later cancel still tombstones).
     bool existed_before = false;
 
     bool isZero() const { return base == 0 && quote == 0; }
@@ -98,10 +100,11 @@ struct AggregateFunctionOrderbookData
 /// Zero drop:
 /// - If state has snapshot_ts: drop all zeros (bucket applies as a snapshot; absence = gone).
 /// - Else: drop zeros only when !existed_before (ephemeral insert…cancel).
-/// First sighting change/cancel sets existed_before; later change/cancel preserve it;
-/// insert clears it (new life). Snapshot levels start false.
-/// State merge: size from later ts; eb from earlier, except rebirth (earlier 0, later +)
-/// takes later.eb.
+/// First sighting: insert/snapshot → eb=false; change/cancel → eb=true.
+/// Updates preserve prev.eb (including insert after cancel — do not clear the witness).
+/// Snapshot row-kind forces eb=false on apply.
+/// State merge: size/ts from later; eb from earlier, including rebirth (earlier 0, later +)
+/// so a cancel tombstone is not lost when merged with a later insert.
 class AggregateFunctionOrderbook final
     : public IAggregateFunctionDataHelper<AggregateFunctionOrderbookData, AggregateFunctionOrderbook>
 {
@@ -383,10 +386,11 @@ private:
                 return prev;
 
             OrderbookLevel lvl = item.lvl;
-            if (is_snapshot || item.op == DepthOp::Insert)
-                lvl.existed_before = false; // clean slate / new life in this state
+            if (is_snapshot)
+                lvl.existed_before = false; // snapshot replace: clean slate
             else
-                // change or cancel: existed_before is about life before this state, not before this op
+                // Preserve witness of life before this state (cancel→insert→cancel must
+                // still tombstone; insert alone must not clear a prior cancel's eb).
                 lvl.existed_before = prev.existed_before;
             return lvl;
         };
@@ -412,9 +416,9 @@ private:
         return out;
     }
 
-    /// Merge two states (no ops). Size/ts LWW (later wins); existed_before hybrid:
-    /// - later live after earlier zero (rebirth) → take later.eb (insert clears prior)
-    /// - otherwise → take earlier.eb (earlier witness of "lived before this state")
+    /// Merge two states (no ops). Size/ts LWW (later wins); existed_before from earlier
+    /// (earlier witness of "lived before this state"), including rebirth
+    /// (earlier zero tombstone + later live insert must keep earlier.eb).
     static std::vector<OrderbookLevel> mergeLevels(
         const std::vector<OrderbookLevel> & a,
         const std::vector<OrderbookLevel> & b,
@@ -435,10 +439,7 @@ private:
             const OrderbookLevel & earlier = (x.ts <= y.ts) ? x : y;
             const OrderbookLevel & later = (x.ts <= y.ts) ? y : x;
             OrderbookLevel w = later; // size/ts from later (tie → y when x.ts == y.ts via <=)
-            if (!later.isZero() && earlier.isZero())
-                w.existed_before = later.existed_before; // rebirth
-            else
-                w.existed_before = earlier.existed_before;
+            w.existed_before = earlier.existed_before;
             return w;
         };
 
@@ -591,7 +592,8 @@ Per-level ops: insert / change / cancel. Row-level kind: delta / snapshot.
 Last-write-wins by timestamp; snapshots prune older levels.
 If the state has a snapshot_ts, final zeros are dropped (applied as a snapshot).
 Otherwise zeros are kept only as tombstones when existed_before
-(change or leading cancel); insert…cancel is ephemeral and dropped.
+(first-sighting change/cancel, preserved across later ops including insert);
+a pure insert…cancel with no prior witness is ephemeral and dropped.
 Incoming prices must be strictly ascending with no duplicates.
     )";
     FunctionDocumentation::Syntax syntax = "orderbook(prices, sizes, ops, ts, kind)";
